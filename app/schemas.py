@@ -195,3 +195,40 @@ class PayloadStorageStatusOut(BaseModel):
     gc_grace_seconds: int
     migration: dict[str, Any]
     gc_runs: list[GCRunOut]
+
+
+# -- 垃圾回收状态查询 ---------------------------------------------------------------
+
+
+class GCStatusOut(BaseModel):
+    """垃圾回收状态总览（只含计数/时间，绝不含载荷内容）。"""
+
+    gc_grace_seconds: int
+    # 当前候选总数；其中已过宽限期、下一轮 gc 可进入最终复核删除的数量
+    candidates: int
+    due_candidates: int
+    # 最老候选已等待的秒数（无候选为 0）
+    oldest_candidate_age_seconds: float
+    # 进行中的提交状态机行数（这些摘要绝不会被删）
+    pending_submissions: int
+    recent_runs: list[GCRunOut]
+
+
+class GCCandidateOut(BaseModel):
+    """单个对象摘要的回收状态。"""
+
+    digest: str
+    # 是否在 GC 候选表中
+    is_candidate: bool
+    first_seen_at: datetime | None = None
+    # 预计可被物理删除的最早时刻（first_seen_at + 宽限期）；非候选为 None
+    eligible_at: datetime | None = None
+    # 宽限期是否已过（下一轮 gc 会对其做最终复核删除）
+    eligible_now: bool
+    # 对象元数据（无元数据行的存储孤儿为 None）
+    size_bytes: int | None = None
+    ref_count: int | None = None
+    object_metadata_exists: bool
+    # 是否存在引用该摘要的进行中提交（存在则不会被删）
+    pending_submission: bool
+    gc_grace_seconds: int

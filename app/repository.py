@@ -319,15 +319,54 @@ async def get_current_version(
 #   1. 快速查重（(source,event_id) 已存在 -> 幂等返回，不触对象存储）；
 #   2. 事务内登记 payload_upload_pending（含规范化字节，崩溃后可重放）：
 #      - 已有别的进程为同一事件登记 -> 其进行中/残留，交由恢复流程，本次报冲突；
-#   3. 事务外幂等 PUT 对象（内容寻址，同键同内容，重复/重放绝对安全）；
-#   4. 终结事务（锁对象元数据行）：upsert 对象元数据并维护引用计数、插入事件
-#      （payload 置 NULL，只挂摘要）、建投递、删除 pending 行——单事务原子，
-#      外部只能看到“完全没有该事件”或“事件+投递+对象引用齐备”，无半成品；
-#   5. 任一步失败：pending 行保留（字节就在行内，不依赖对象存储），恢复或
+#   3. 终结事务（按摘要咨询锁内幂等 PUT 对象，再 upsert 对象元数据并维护引用
+#      计数、插入事件（payload 置 NULL，只挂摘要）、建投递、删除 pending 行）：
+#      单事务原子，外部只能看到“完全没有该事件”或“事件+投递+对象引用齐备”，
+#      无半成品；PUT 与建引用同在与 GC 互斥的锁内，对象不会被并发 GC 删除；
+#   4. 任一步失败：pending 行保留（字节就在行内，不依赖对象存储），恢复或
 #      重试从第 3 步继续；终结事务回滚则没有悬空引用，重放整步即可。
 #
 # 同一 (source,event_id) 的并发提交由 events 唯一约束兜底；重复提交不新增投递
 # 的幂等语义不变（第 1 步命中即直接返回原事件）。
+#
+# 与 GC 的引用互斥（关键）：
+# “引用建立”与“对象物理删除”均持有按摘要划分的事务级咨询锁
+# （payload_object_xact_lock，元数据行尚不存在的存储孤儿也能被覆盖——行锁
+# 无法保护不存在的行）。引用方在同一事务、同一把锁内完成
+# “锁 -> 确保对象在存储中（PUT）-> 建元数据/引用”，GC 在同一把锁内完成
+# “锁 -> 最终复核 -> 物理删对象 -> 删元数据”，两者对同一摘要严格串行：
+# 引用方先拿锁则 GC 复核必见引用而复活；GC 先拿锁则引用方等到对象删除完成后
+# 再幂等重传同一内容寻址对象并建引用。无论元数据行是否存在，对象一旦被引用
+# 都不会被删除。
+
+# 载荷对象咨询锁的固定 classid（两参数形式 (classid, objid)，与一参数形式的
+# 键空间独立；objid 取摘要前 8 个 hex 字符的有符号 int32 值，同一摘要恒定
+# 映射同一把锁）。
+_PAYLOAD_LOCK_CLASSID = 0x5041594C  # 'PAYL'
+_INT32_WRAP = 1 << 32
+_INT32_HALF = 1 << 31
+
+
+def _digest_lock_key(digest: str) -> int:
+    """摘要前 8 个 hex 字符 -> 有符号 int32（pg_advisory_xact_lock 的 objid）。"""
+    value = int(digest[:8], 16)
+    return value - _INT32_WRAP if value >= _INT32_HALF else value
+
+
+async def payload_object_xact_lock(
+    conn: asyncpg.Connection, digest: str
+) -> None:
+    """获取按摘要划分的事务级咨询锁（同事务内可重入，事务结束自动释放）。
+
+    用于把同一内容对象的“引用建立/恢复/迁移”与 GC 的“最终复核+物理删除”
+    串行化；覆盖 event_payload_objects 元数据行尚不存在的存储孤儿场景。
+    """
+    await conn.fetchval(
+        "SELECT pg_advisory_xact_lock($1::int4, $2::int4)",
+        _PAYLOAD_LOCK_CLASSID,
+        _digest_lock_key(digest),
+    )
+
 
 async def find_event_by_key(
     conn: asyncpg.Connection, source: str, event_id: str
@@ -421,16 +460,19 @@ async def finalize_event_submission(
 ) -> tuple[asyncpg.Record, bool]:
     """提交状态机终结（单事务，原子可见）。
 
-    锁对象元数据行（不存在则插入，ref_count 从 0 计起）后插入事件并建投递；
-    事件唯一冲突说明并发重复提交已抢先完成：回滚本次引用计数增量，返回
-    (原事件行, True)。正常插入返回 (新事件行, False)。
+    调用方必须已在同一连接上开启事务，并已在持有本摘要咨询锁的状态下完成
+    对象存储 PUT（见 payloads._put_and_finalize）。本函数在事务内再次获取
+    同一把可重入咨询锁，然后 upsert 元数据行、插入事件并建投递；事件唯一
+    冲突说明并发重复提交已抢先完成：不增加引用计数，返回 (原事件行, True)。
+    正常插入返回 (新事件行, False)。
 
     新事件 payload JSONB 列置 NULL——载荷本体只在对象存储；该列仅旧数据使用。
     """
     async with conn.transaction():
-        # 与垃圾回收互斥：GC 删除在持有对象元数据行锁的事务内完成“复核→删对象
-        # →删元数据”，会阻塞这里的引用建立；反之本事务未提交时引用尚不可见，
-        # GC 复核必为零引用且本对象仍处于 pending（NOT EXISTS 守卫）而不会误删。
+        # 与垃圾回收互斥：咨询锁覆盖“元数据行尚不存在”的存储孤儿情形，
+        # 行锁再序列化元数据已存在时的引用计数维护；GC 的“行锁复核+物理
+        # 删除”同样先取本咨询锁，两边对同一摘要不可能交错。
+        await payload_object_xact_lock(conn, digest)
         await conn.execute(
             """
             INSERT INTO event_payload_objects (digest, size_bytes, ref_count)
@@ -440,7 +482,8 @@ async def finalize_event_submission(
             digest,
             size_bytes,
         )
-        # 行锁序列化对象的“引用建立”与 GC 的“行锁复核+删除”。
+        # 行锁序列化对象的“引用建立”与 GC 的“行锁复核+删除”（咨询锁之外的
+        # 第二重保险，且保证 ref_count 读改写不与其他提交互相丢更新）。
         await conn.execute(
             "SELECT digest FROM event_payload_objects WHERE digest = $1 FOR UPDATE",
             digest,
@@ -1194,10 +1237,13 @@ async def attach_payload_object_to_event(
 ) -> None:
     """把旧事件挂到内容寻址对象（同事务 upsert 元数据并维护引用计数）。
 
-    对象字节由调用方（payloadadmin）先幂等上传到对象存储；此处只做数据库侧
-    链接，因此与新提交共用同一份不可变对象、自动去重。锁对象行使引用建立与
-    GC 的“行锁复核+删除”互斥，杜绝迁移与 GC 并发时的悬空引用。
+    对象字节由调用方（payloadadmin）在已持有本摘要咨询锁的状态下幂等上传到
+    对象存储（见 payloads.migrate_legacy_payloads）；此处只做数据库侧链接，
+    因此与新提交共用同一份不可变对象、自动去重。咨询锁使引用建立与 GC 的
+    “最终复核+物理删除”互斥，杜绝迁移与 GC 并发时（含元数据行尚不存在的
+    存储孤儿）的悬空引用。
     """
+    await payload_object_xact_lock(conn, digest)
     await conn.execute(
         """
         INSERT INTO event_payload_objects (digest, size_bytes, ref_count)
@@ -1351,25 +1397,42 @@ async def list_gc_candidates(
     return [r["digest"] for r in rows]
 
 
+async def pending_exists_for_digest(conn: asyncpg.Connection, digest: str) -> bool:
+    """是否存在引用该摘要的进行中提交状态机行。"""
+    return (
+        await conn.fetchval(
+            "SELECT 1 FROM payload_upload_pending WHERE digest = $1 LIMIT 1",
+            digest,
+        )
+        is not None
+    )
+
+
 async def recheck_gc_candidate(
     conn: asyncpg.Connection, digest: str
 ) -> str:
-    """删除前的最终引用复核（不持有事务，调用方需在事务内 FOR UPDATE 锁定）。
+    """删除前的最终引用复核（调用方需已开启事务，本函数获取互斥锁）。
 
-    必须在调用方已开启的事务中、对对象元数据行加锁后使用；本函数只判定，
-    不改数据。返回：
+    在调用方事务内先获取按摘要的咨询锁（与所有“引用建立”路径互斥，覆盖
+    元数据行尚不存在的存储孤儿），再对对象元数据行加行锁后判定。返回：
+    - 'gone'     ：候选行已不存在（被并发 GC 处理），本轮跳过；
     - 'delete'   ：零引用且无进行中提交（或元数据不存在的存储孤儿键）；
-    - 'reanimate'：引用已重建（并发提交/重放复用了同一内容对象）或仍有进行中
-                   提交，候选应移除/重新计时，对象保留。
+    - 'reanimate'：引用已重建（并发提交/恢复/迁移复用了同一内容对象）或仍有
+                   进行中提交，候选移除、对象保留。
     """
+    await payload_object_xact_lock(conn, digest)
+    candidate = await conn.fetchval(
+        "SELECT 1 FROM payload_gc_candidates WHERE digest = $1 FOR UPDATE",
+        digest,
+    )
+    if candidate is None:
+        return "gone"
     obj = await conn.fetchrow(
         "SELECT ref_count FROM event_payload_objects WHERE digest = $1 FOR UPDATE",
         digest,
     )
-    in_flight = await conn.fetchval(
-        "SELECT 1 FROM payload_upload_pending WHERE digest = $1 LIMIT 1", digest
-    )
-    if in_flight is not None:
+    in_flight = await pending_exists_for_digest(conn, digest)
+    if in_flight:
         return "reanimate"
     if obj is not None and obj["ref_count"] > 0:
         return "reanimate"
@@ -1437,6 +1500,35 @@ async def count_payload_objects(conn: asyncpg.Connection) -> int:
 
 async def count_payload_candidates(conn: asyncpg.Connection) -> int:
     return await conn.fetchval("SELECT COUNT(*) FROM payload_gc_candidates")
+
+
+async def gc_candidate_overview(conn: asyncpg.Connection) -> asyncpg.Record:
+    """GC 候选聚合：候选总数、已过宽限期待删数、最老候选年龄（秒）。"""
+    grace_before = datetime.now(timezone.utc) - timedelta(
+        seconds=settings.payload_gc_grace_seconds
+    )
+    return await conn.fetchrow(
+        """
+        SELECT COUNT(*)                                              AS candidates,
+               COUNT(*) FILTER (WHERE first_seen_at < $1)            AS due,
+               COALESCE(EXTRACT(EPOCH FROM (now() - MIN(first_seen_at))), 0)
+                   AS oldest_age_seconds
+        FROM payload_gc_candidates
+        """,
+        grace_before,
+    )
+
+
+async def get_gc_candidate(
+    conn: asyncpg.Connection, digest: str
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        SELECT digest, first_seen_at
+        FROM payload_gc_candidates WHERE digest = $1
+        """,
+        digest,
+    )
 
 
 async def count_pending_submissions(conn: asyncpg.Connection) -> int:

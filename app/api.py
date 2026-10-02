@@ -1,6 +1,8 @@
 """HTTP API：事件提交、订阅与配置版本管理、投递历史、死信与重放。"""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import asyncpg
 from fastapi import APIRouter, HTTPException, Query, Response
 
@@ -17,6 +19,7 @@ from app.keyring import get_keyring
 from app.objectstore import (
     ObjectStoreError,
     get_object_store,
+    is_valid_digest,
 )
 from app.schemas import (
     AttemptOut,
@@ -24,7 +27,9 @@ from app.schemas import (
     DeliveryOut,
     EventCreate,
     EventOut,
+    GCCandidateOut,
     GCRunOut,
+    GCStatusOut,
     PayloadStorageStatusOut,
     ReplayOut,
     ReplayRequest,
@@ -610,4 +615,75 @@ async def payload_storage_status() -> PayloadStorageStatusOut:
             else None,
         },
         gc_runs=[GCRunOut(**dict(r)) for r in gc_runs],
+    )
+
+
+# -- 垃圾回收状态 -------------------------------------------------------------------
+
+
+@router.get("/payloads/gc", response_model=GCStatusOut, tags=["payloads"])
+async def payload_gc_status() -> GCStatusOut:
+    """垃圾回收状态总览（候选数、到期数、最近运行；只含计数，不含载荷内容）。
+
+    - `candidates`：当前 GC 候选（零引用标记或 --rescan-store 登记的存储孤儿）；
+    - `due_candidates`：已超过宽限期、下一轮 gc 将进入“最终复核→删除”的数量；
+    - 进行中提交（`pending_submissions`）引用的对象绝不会被删除。
+    物理回收仍由管理命令 `python -m app.payloadadmin gc` 触发（本接口只读）。
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        overview = await repo.gc_candidate_overview(conn)
+        pending = await repo.count_pending_submissions(conn)
+        gc_runs = await repo.list_gc_runs(conn, limit=10)
+    return GCStatusOut(
+        gc_grace_seconds=settings.payload_gc_grace_seconds,
+        candidates=overview["candidates"],
+        due_candidates=overview["due"],
+        oldest_candidate_age_seconds=float(overview["oldest_age_seconds"] or 0),
+        pending_submissions=pending,
+        recent_runs=[GCRunOut(**dict(r)) for r in gc_runs],
+    )
+
+
+@router.get(
+    "/payloads/gc/{digest}",
+    response_model=GCCandidateOut,
+    tags=["payloads"],
+)
+async def payload_gc_digest_status(digest: str) -> GCCandidateOut:
+    """查询单个对象摘要的回收状态（候选标记、到期时刻、引用计数、进行中提交）。
+
+    对象被任一事件引用（或存在引用该摘要的进行中提交）时不会被删除；
+    无元数据行的存储孤儿也可经此查询其候选与到期状态。摘要必须是 64 位
+    小写十六进制 SHA-256，否则 400。
+    """
+    if not is_valid_digest(digest):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_digest", "message": "摘要必须是 64 位十六进制 SHA-256"},
+        )
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        candidate = await repo.get_gc_candidate(conn, digest)
+        obj = await repo.get_payload_object(conn, digest)
+        in_flight = await repo.pending_exists_for_digest(conn, digest)
+    grace = settings.payload_gc_grace_seconds
+    first_seen = candidate["first_seen_at"] if candidate is not None else None
+    eligible_at = (
+        first_seen + timedelta(seconds=grace) if first_seen is not None else None
+    )
+    return GCCandidateOut(
+        digest=digest,
+        is_candidate=candidate is not None,
+        first_seen_at=first_seen,
+        eligible_at=eligible_at,
+        eligible_now=(
+            eligible_at is not None
+            and eligible_at <= datetime.now(timezone.utc)
+        ),
+        size_bytes=obj["size_bytes"] if obj is not None else None,
+        ref_count=obj["ref_count"] if obj is not None else None,
+        object_metadata_exists=obj is not None,
+        pending_submission=in_flight,
+        gc_grace_seconds=grace,
     )

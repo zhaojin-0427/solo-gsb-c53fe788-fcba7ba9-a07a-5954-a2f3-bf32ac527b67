@@ -21,8 +21,11 @@
         # --rescan-store 同时登记对象存储里有、数据库元数据里没有的孤儿
         # （同样需要再过一轮宽限才会删除）。
 
-所有命令与在线提交/投递并发安全：标记不阻塞写入，删除前在对象元数据行锁内
-复核引用与进行中的提交状态机，并发提交或死信重放正在复用的对象会被复活。
+所有命令与在线提交/投递并发安全：标记不阻塞写入；删除前在“按摘要的事务级
+咨询锁 + 候选/元数据行锁”内复核引用与进行中的提交状态机，并发提交、崩溃
+恢复或在线迁移正在复用的对象会被复活——即使对象在存储中已存在而数据库尚无
+元数据行（--rescan-store 登记的孤儿），咨询锁同样提供互斥。HTTP 侧可经
+GET /api/v1/payloads/gc 与 /api/v1/payloads/gc/{digest} 查询回收状态。
 """
 from __future__ import annotations
 
@@ -50,6 +53,7 @@ async def _status(verbose: bool) -> int:
             legacy = await repo.count_legacy_events(conn)
             objects = await repo.count_payload_objects(conn)
             candidates = await repo.count_payload_candidates(conn)
+            gc_overview = await repo.gc_candidate_overview(conn)
             pending = await repo.count_pending_submissions(conn)
             migration = await payloads.migration_status(conn)
             gc_runs = await repo.list_gc_runs(conn)
@@ -72,7 +76,9 @@ async def _status(verbose: bool) -> int:
         f"去重对象数={objects}，引用总数={ref_sum}，对象总字节={bytes_sum}"
     )
     print(
-        f"提交状态机残留={pending}，GC 候选={candidates}，"
+        f"提交状态机残留={pending}，GC 候选={candidates}"
+        f"（已过宽限期 {gc_overview['due']} 个，"
+        f"最老候选 {float(gc_overview['oldest_age_seconds']):.0f}s），"
         f"GC 宽限期={settings.payload_gc_grace_seconds}s"
     )
     print(

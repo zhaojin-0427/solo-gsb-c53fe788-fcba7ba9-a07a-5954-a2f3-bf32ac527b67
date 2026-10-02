@@ -15,10 +15,18 @@
   JSONB 空间（此时所有读路径都已只认对象）。
 
 垃圾回收（run_gc）：
-  标记（零引用且无进行中提交）→ 宽限期 → 逐对象行锁复核引用（防并发
-  提交/重放复用同一内容对象）→ 删对象 → 删元数据；
+  标记（零引用且无进行中提交）→ 宽限期 → 逐对象在“按摘要的咨询锁 +
+  元数据行锁”内复核引用（防并发提交/恢复/迁移复用同一内容对象）→
+  删对象 → 删元数据；
   --rescan-store 额外清理“对象存储里有、元数据里没有”的孤儿（崩溃于上传后、
   终结前的对象，或手工残留），同样先过宽限候选。
+
+引用互斥（与 GC 的竞态修复）：
+  所有建立对象引用的路径（新提交终结、崩溃恢复、旧数据在线迁移）都在同一
+  数据库事务、同一把按摘要的事务级咨询锁内完成“锁 → 幂等 PUT 对象 →
+  建元数据与引用”；GC 的最终复核与物理删除持有同一把锁。锁的粒度是摘要，
+  因而即使对象在存储中存在而数据库尚无元数据行（--rescan-store 登记的孤儿），
+  并发的新提交/恢复/迁移也会与删除严格串行：对象一旦被引用就绝不可能被删。
 """
 from __future__ import annotations
 
@@ -70,8 +78,8 @@ async def submit_event_payload(
     """执行一次提交，返回 (event 行, 是否重复)。
 
     成功返回时对象与数据库引用均已就绪；任何失败都不产生可见半成品。
-    `conn` 由调用方提供，但本函数不把“对象上传”包进数据库事务
-    （见模块/仓库文件头的状态机说明）。
+    `conn` 由调用方提供；对象上传在终结事务、按摘要咨询锁内完成
+    （见模块/仓库文件头的状态机说明），与 GC 的物理删除互斥。
     """
     # 第 1 步：快速查重（常见路径，零对象存储调用）。
     existing = await repo.find_event_by_key(conn, source, event_id)
@@ -114,11 +122,50 @@ async def submit_event_payload(
                 f"事件 ({source}, {event_id}) 正并发提交，请稍后重试"
             ) from exc
 
-    # 第 3 步：事务外幂等上传不可变对象。内容寻址 => 重传/并发传同一键安全。
-    await store.put_object(digest, data)
-
-    # 第 4 步：终结事务（对象元数据 + 引用计数 + 事件 + 投递 + 清 pending）。
+    # 第 3+4 步：在“持有按摘要咨询锁的终结事务”内幂等上传对象并建引用。
+    #
+    # 关键：对象 PUT 必须在锁内（而不是事务外先传），否则 GC 可在“对象已
+    # 传、元数据/引用尚不可见”的窗口把对象删掉（元数据行尚不存在时行锁也
+    # 拦不住）。内容寻址对象不可变，锁内重复 PUT 天然幂等；对象存储失败时
+    # 事务回滚（无元数据/引用变更），pending 行保留，可安全重试/恢复。
     try:
+        return await _put_and_finalize(
+            conn,
+            store,
+            source=source,
+            event_id=event_id,
+            digest=digest,
+            data=data,
+        )
+    except Exception:
+        # 终结失败：pending 行保留，由 recover_pending 续跑；对象即便已上传
+        # 但事务回滚，也是零引用孤儿，最终由 GC 的 --rescan-store 清理。
+        log.exception(
+            "提交终结失败，保留状态机行待恢复: source=%s event_id=%s digest=%s",
+            source, event_id, digest,
+        )
+        raise
+
+
+async def _put_and_finalize(
+    conn: asyncpg.Connection,
+    store: ObjectStore,
+    *,
+    source: str,
+    event_id: str,
+    digest: str,
+    data: bytes,
+) -> tuple[asyncpg.Record, bool]:
+    """锁内“确保对象存在 → 终结（元数据/引用/事件/投递/清 pending）”。
+
+    终结事务先获取按摘要的事务级咨询锁（finalize_event_submission 内部再次
+    可重入获取同一把），与 GC 的“最终复核 → 物理删除”严格互斥。拿到锁后
+    幂等 PUT：若 GC 刚刚删除了该对象，这里会把同一内容重新写回再建引用，
+    因此不存在悬空引用；PUT 已存在的同键对象是内容寻址下的空操作。
+    """
+    async with conn.transaction():
+        await repo.payload_object_xact_lock(conn, digest)
+        await store.put_object(digest, data)
         return await repo.finalize_event_submission(
             conn,
             source=source,
@@ -126,14 +173,6 @@ async def submit_event_payload(
             digest=digest,
             size_bytes=len(data),
         )
-    except Exception:
-        # 终结失败：pending 行保留，由 recover_pending 续跑；对象即便已上传
-        # 也是零引用孤儿，最终由 GC 的 --rescan-store 清理。
-        log.exception(
-            "提交终结失败，保留状态机行待恢复: source=%s event_id=%s digest=%s",
-            source, event_id, digest,
-        )
-        raise
 
 
 async def _wait_for_event(
@@ -246,13 +285,15 @@ async def recover_pending(
                 handled += 1
                 continue
             await repo.adopt_pending_submission(conn, row["id"], owner_id)
-            await store.put_object(digest, data)
-            await repo.finalize_event_submission(
+            # 与新提交共用同一把“锁内 PUT + 终结”路径：恢复期间同摘要的
+            # GC 删除被咨询锁挡住，杜绝“恢复上传中对象被删”的悬空引用。
+            await _put_and_finalize(
                 conn,
+                store,
                 source=row["source"],
                 event_id=row["event_id"],
                 digest=digest,
-                size_bytes=len(data),
+                data=data,
             )
             handled += 1
         except ObjectStoreError:
@@ -327,6 +368,11 @@ async def migrate_legacy_payloads(
             payload = row["payload"] if row["payload"] is not None else {}
             data = canonical_payload_bytes(payload)
             digest = content_digest(data)
+            # 先取按摘要的咨询锁，再在锁内幂等上传：与 GC 的“最终复核+物理
+            # 删除”互斥（attach_payload_object_to_event 会可重入地再取一次
+            # 同一把锁）。否则“对象已传、引用事务未提交”的窗口里 GC 可能
+            # 删掉对象，造成迁移后的悬空引用。
+            await repo.payload_object_xact_lock(conn, digest)
             try:
                 await store.put_object(digest, data)
             except ObjectStoreError as exc:
@@ -377,7 +423,8 @@ async def run_gc(
     """执行一轮 GC：标记 -> 宽限复核 -> 删除。返回统计。
 
     幂等：候选表记录 first_seen_at，重复运行只推进真正过期的对象；
-    删除前在对象元数据行锁内复核 ref_count 与进行中提交，防并发误删。
+    删除前在按摘要的咨询锁与候选/元数据行锁内复核 ref_count 与进行中提交，
+    与并发的新提交/恢复/迁移互斥，防误删（含无元数据行的存储孤儿）。
     """
     grace = settings.payload_gc_grace_seconds if grace_seconds is None else grace_seconds
     run_id = await repo.start_gc_run(conn, rescanned_store=rescan_store)
@@ -411,13 +458,20 @@ async def run_gc(
 async def _delete_one_guarded(conn, store: ObjectStore, digest: str) -> int:
     """在单个数据库事务内完成“锁定复核 → 删对象 → 删元数据”。
 
-    行锁在整个对象物理删除期间保持：并发提交的终结事务在 upsert/锁对象行处
-    阻塞，直到本事务提交（对象与元数据一起消失）或回滚（对象仍在），因此
-    不存在“复核零引用后、删除前被并发建引用”而误删在用对象的窗口。
-    对象删除本身失败则整个事务回滚，候选宽限重新计时，下轮重试。
+    复核先取按摘要的事务级咨询锁并锁定候选行：
+    - 咨询锁贯穿物理删除全程，并发提交/恢复/迁移的“锁内 PUT + 建引用”必须
+      等到本事务提交（对象与元数据一起消失）或回滚（对象仍在），不存在
+      “复核零引用后、删除前被并发建引用”而误删在用对象的窗口；元数据行
+      尚不存在的存储孤儿同样受该锁保护（候选行本身也 FOR UPDATE 锁定）；
+    - 复核为 reanimate（引用已重建或有进行中提交）：移除候选、对象保留；
+    - 候选已被并发 GC 处理（gone）：跳过，不重复计数；
+    - 对象物理删除失败：宽限重新计时并提交本事务（下轮 GC 幂等重试），
+      不拖垮整轮回收，也不改变任何引用/提交状态。
     """
     async with conn.transaction():
         verdict = await repo.recheck_gc_candidate(conn, digest)
+        if verdict == "gone":
+            return 0
         if verdict == "reanimate":
             await repo.remove_gc_candidate(conn, digest)
             return 0
@@ -425,7 +479,7 @@ async def _delete_one_guarded(conn, store: ObjectStore, digest: str) -> int:
             await store.delete_object(digest)
         except ObjectStoreError:
             # 对象删除失败：宽限重新计时并提交本事务（下轮 GC 重试），
-            # 不拖垮整轮回收。
+            # 不拖垮整轮回收。对象存储删除本身幂等，重试不破坏任何状态。
             log.warning("GC 删除对象失败，宽限重置，下轮重试: %s", digest)
             await repo.rollback_gc_candidate(conn, digest)
             return 0
@@ -437,16 +491,24 @@ async def _sweep_store_orphans(conn, store: ObjectStore) -> int:
     """登记“存储里存在、元数据里不存在”的对象（上传后崩溃的残留）。
 
     本函数只登记候选（first_seen_at 起算宽限期）；真正的删除由下一轮 GC 的
-    主 sweep 在行锁复核后统一完成——并发提交或重放重新建立引用的对象会被
-    复活而不会被误删。本函数始终返回 0（本轮不直接产生删除）。
+    主 sweep 在咨询锁 + 行锁复核后统一完成——并发提交、恢复或迁移重新建立
+    引用的对象会被复活而不会被误删。已有元数据、或存在进行中提交状态机行
+    （对象可能正处于“先上传、后终结”窗口）的键一律跳过。本函数始终返回 0
+    （本轮不直接产生删除）。
     """
     registered = 0
+    skipped_metadata = 0
+    skipped_pending = 0
     seen = 0
     async for key in store.iter_all_keys():
         seen += 1
         obj = await repo.get_payload_object(conn, key)
         if obj is not None:
+            skipped_metadata += 1
             continue  # 元数据存在：正常对象（零引用由主 sweep 处理）
+        if await repo.pending_exists_for_digest(conn, key):
+            skipped_pending += 1
+            continue  # 进行中提交：终结事务会在锁内重建元数据与引用
         await conn.execute(
             """
             INSERT INTO payload_gc_candidates (digest)
@@ -457,7 +519,7 @@ async def _sweep_store_orphans(conn, store: ObjectStore) -> int:
         registered += 1
     log.info(
         "存储孤儿扫描完成：枚举 %s 个对象，新登记孤儿候选 %s 个"
-        "（过宽限期后由下一轮 GC 删除）",
-        seen, registered,
+        "（跳过有元数据 %s、有进行中提交 %s；过宽限期后由下一轮 GC 删除）",
+        seen, registered, skipped_metadata, skipped_pending,
     )
     return 0

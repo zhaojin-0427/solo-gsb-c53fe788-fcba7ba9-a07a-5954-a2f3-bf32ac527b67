@@ -139,6 +139,8 @@ curl -s localhost:8001/received | python3 -m json.tool
 # 6) 查看事件载荷的内容地址（payload_digest 即规范化 JSON 的 SHA-256）
 #    与对象存储去重/迁移/GC 状态（对象本体在 MinIO 的 webhook-payloads 桶中）
 curl -s localhost:8000/api/v1/payloads/status | python3 -m json.tool
+# 垃圾回收状态（候选/到期数、最近一轮 GC 运行；物理回收见下文管理命令）
+curl -s localhost:8000/api/v1/payloads/gc | python3 -m json.tool
 # 也可在 MinIO 控制台 http://localhost:9001 浏览 webhook-payloads 桶（minioadmin/minioadmin）
 ```
 
@@ -188,6 +190,8 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 | POST | `/dead-letters/{id}/replay` | 死信重放（201；非死信 409；链上有未完成投递 409） |
 | GET | `/crypto/status` | 密钥环/迁移/轮换状态（只含 key_id，不含密钥材料） |
 | GET | `/payloads/status` | 载荷对象存储/去重/在线迁移/GC 状态（只含计数，不含载荷内容） |
+| GET | `/payloads/gc` | 垃圾回收总览（候选/到期数、宽限、最近运行；只读） |
+| GET | `/payloads/gc/{digest}` | 单个对象摘要的回收状态（候选/到期时刻/引用计数/进行中提交；只读） |
 | GET | `/health` | 健康检查 |
 
 投递状态：`pending`（等待/退避中）、`in_flight`（已被 Worker 认领）、
@@ -352,16 +356,22 @@ hmac.compare_digest(expected, signature_v1)
 
 1. **查重**：`(source, event_id)` 已存在 → 直接幂等返回，不触对象存储；
 2. **登记状态机行**（独立事务，含规范化字节）：崩溃后字节仍在、可重放；
-3. **幂等上传对象**（事务外）：内容寻址，重复/并发/重传同键都安全；
-4. **终结事务**（单数据库事务，锁对象元数据行）：upsert 对象元数据并维护引用
-   计数 → 插入事件（payload 置 NULL，只挂摘要）→ 建投递 → 删除状态机行。
+3. **锁内终结**（单数据库事务）：获取按摘要的事务级咨询锁 → **幂等上传对象**
+   → upsert 对象元数据并维护引用计数 → 插入事件（payload 置 NULL，只挂摘要）
+   → 建投递 → 删除状态机行。
+
+对象 PUT 与“建立引用”在同一把咨询锁、同一事务内完成，与 GC 的“最终复核→
+物理删除”严格互斥（GC 一节详述），因此即使对象在存储中已存在而数据库尚无
+元数据行，也不会出现悬空引用；若对象恰被并发 GC 删除，锁释放后提交方幂等
+重传同一内容寻址对象即可。
 
 外部观察者只能看到“完全没有该事件”或“事件 + 投递 + 对象引用齐备”，不存在
 可见半成品。任一步失败或进程重启：
 
 - 状态机行保留（字节就在行内），由 **api 进程后台恢复任务**周期续跑，也可
   手动 `python -m app.payloadadmin recover` 立即接管；
-- 恢复时幂等补传缺失对象并重放终结事务；事件已存在（重复提交完成）则清理残留；
+- 恢复时在同一把咨询锁内幂等补传缺失对象并重放终结事务；事件已存在（重复
+  提交完成）则清理残留；
 - 上传成功但终结失败产生的“零引用对象”不会被立即删除，最终由 GC 的存储孤儿
   扫描在宽限期后清理。
 
@@ -419,20 +429,85 @@ docker compose run --rm api python -m app.payloadadmin gc
 docker compose run --rm api python -m app.payloadadmin gc --rescan-store
 ```
 
-删除一个对象前有四重保护，**并发提交或死信重放正在复用的对象不会被误删**：
+删除一个对象前有五重保护，**并发提交、崩溃恢复、旧数据迁移或死信重放正在
+复用的对象绝不会被误删——即使该对象在存储中已存在而数据库尚无元数据行**
+（`--rescan-store` 登记的存储孤儿）：
 
 1. 标记阶段只收集 `ref_count = 0` 的对象；
 2. `NOT EXISTS payload_upload_pending`：进行中的提交（引用尚未在终结事务建立）
-   不进入候选；
+   不进入候选；存储孤儿扫描也跳过存在进行中提交的键；
 3. **宽限期**（`PAYLOAD_GC_GRACE_SECONDS`，默认 3600 秒）：候选首次见后必须
    持续零引用超过宽限期；引用在期间重建的对象被“复活”保留；
-4. 删除时在**单个数据库事务**内“锁对象元数据行（`FOR UPDATE`）→ 复核引用计数
-   与进行中提交 → 删对象 → 删元数据”，行锁贯穿物理删除全程——并发提交的终结
-   事务在该锁上阻塞，因而不存在“复核零引用后、删除前被并发建引用”的窗口；
-   对象删除失败则宽限重置、整轮回滚该候选，下次重试。
+4. 删除时在**单个数据库事务**内“按摘要咨询锁 + 候选行/元数据行锁
+   （`FOR UPDATE`）→ 最终复核引用计数与进行中提交 → 物理删对象 → 删元数据”，
+   锁贯穿物理删除全程；
+5. **按摘要的事务级咨询锁**是互斥的关键：所有建立引用的路径（新提交终结、
+   崩溃恢复 `recover`、旧数据 `migrate`）都在**同一数据库事务、同一把咨询锁
+   内**完成“加锁 → 幂等 PUT 对象 → 建元数据与引用”。咨询锁不依赖元数据行
+   是否存在，因此“存储里有对象、数据库无元数据”的孤儿也被覆盖——
+   - 提交方先持锁：GC 在锁上等待，提交后复核必见引用 → 复活保留；
+   - GC 先持锁并删除：提交方等锁后把同一内容寻址对象**幂等重传**再建引用，
+     事件引用永远指向一个真实存在且摘要一致的对象，无悬空引用。
+
+   对象物理删除失败（S3 5xx/超时等）时只重置该候选的宽限计时并提交事务，
+   下一轮 GC 幂等重试；删除接口本身幂等（404 视为成功），不改变任何引用
+   计数，也不破坏事件提交的幂等与状态机语义。
 
 宽限期默认 1 小时：因此典型节奏是**定时跑 `gc`**（第一轮标记、后续轮删除到期
 候选）。`gc` 幂等，重复运行只会推进真正到期且仍零引用的对象。
+
+#### 通过 HTTP API 查询回收状态
+
+GC 总览（候选数、已过宽限期的到期数、最老候选等待时长、进行中提交数与
+最近运行记录；只读、只含计数，绝不含载荷内容）：
+
+```bash
+$ curl -s localhost:8000/api/v1/payloads/gc | python3 -m json.tool
+{
+    "gc_grace_seconds": 3600,
+    "candidates": 2,
+    "due_candidates": 1,
+    "oldest_candidate_age_seconds": 4021.7,
+    "pending_submissions": 0,
+    "recent_runs": [
+        {
+            "id": 17,
+            "status": "completed",
+            "candidates": 2,
+            "deleted_objects": 1,
+            "rescanned_store": true,
+            "last_error": null,
+            "started_at": "2026-10-02T08:30:00.123456+00:00",
+            "finished_at": "2026-10-02T08:30:02.481205+00:00"
+        }
+    ]
+}
+```
+
+按对象摘要查询单个对象的回收状态（含元数据是否存在、引用计数、预计可删除
+时刻、是否有进行中提交）：
+
+```bash
+$ curl -s localhost:8000/api/v1/payloads/gc/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
+    | python3 -m json.tool
+{
+    "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "is_candidate": true,
+    "first_seen_at": "2026-10-02T07:23:00.000000+00:00",
+    "eligible_at": "2026-10-02T08:23:00.000000+00:00",
+    "eligible_now": true,
+    "size_bytes": 4,
+    "ref_count": 0,
+    "object_metadata_exists": true,
+    "pending_submission": false,
+    "gc_grace_seconds": 3600
+}
+```
+
+存储孤儿（元数据行不存在）的查询响应中 `object_metadata_exists=false`、
+`size_bytes/ref_count=null`；摘要不是 64 位十六进制时返回
+`400 {"detail":{"code":"invalid_digest",...}}`。物理回收仍由管理命令
+`python -m app.payloadadmin gc` 触发，HTTP 接口只读。
 
 ### 载荷对象存储配置
 

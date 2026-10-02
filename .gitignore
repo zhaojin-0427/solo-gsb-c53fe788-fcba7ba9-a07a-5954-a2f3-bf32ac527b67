@@ -6,6 +6,9 @@ __pycache__/
 .stress-pgdata/
 .test-crypto-pgdata/
 .test-store-pgdata/
+.test-gc-pgdata/
+.gc-pgdata-*/
+.gc-store-*/
 .test-payloads/
 .test-payloads-crypto/
 .local-payloads/
