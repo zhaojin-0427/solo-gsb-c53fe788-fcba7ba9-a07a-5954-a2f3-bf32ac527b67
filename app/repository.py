@@ -374,8 +374,8 @@ async def register_pending_submission(
     return await conn.fetchrow(
         """
         INSERT INTO payload_upload_pending
-            (digest, source, event_id, payload_bytes, owner_id)
-        VALUES ($1, $2, $3, $4, $5)
+            (digest, source, event_id, payload_bytes, owner_id, status)
+        VALUES ($1, $2, $3, $4, $5, 'submitting')
         RETURNING id, digest, source, event_id, payload_bytes, owner_id,
                   created_at, updated_at
         """,
@@ -401,6 +401,72 @@ async def adopt_pending_submission(
     )
 
 
+# -- 载荷对象“按摘要”引用互斥锁 ---------------------------------------------------
+#
+# 物理删除与“建立引用”之间的互斥不能只靠 event_payload_objects 行锁：
+# - --rescan-store 登记的存储孤儿在数据库里**没有元数据行**（无行可锁）；
+# - 新提交在“pending 已登记、终结事务尚未 upsert 元数据行”之间，GC 侧也没有
+#   任何行能阻塞它。
+# 仅靠“复核 ref_count / pending 后再删”存在 TOCTOU 窗口：复核通过后并发提交
+# 恰好在物理删除前完成 PUT、删除后完成终结提交，就会留下“事件引用已提交、对象
+# 已被删”的悬空引用。
+#
+# 因此对每个摘要再设一把 PostgreSQL 咨询锁（digest 为 256 位，取低 31 位作锁号；
+# 碰撞只会让无关摘要额外串行，不影响正确性）：
+# - 提交/恢复：会话级 pg_advisory_lock，覆盖“登记 pending → PUT 对象 → 终结
+#   事务提交”全程（PUT 在数据库事务外，必须用会话级锁）；
+# - 在线迁移：事务级 pg_advisory_xact_lock，覆盖批次内“PUT 对象 → 挂引用提交”；
+# - GC：事务级 pg_advisory_xact_lock，覆盖“最终复核 → 物理删除 → 删元数据”。
+#
+# 三方两两互斥。GC 持锁期间不可能有引用建立；引用方持锁期间：
+#   - 若 GC 尚未运行，复核必见引用/pending，对象复活；
+#   - 若 GC 已抢先删完，引用方随后的幂等 PUT 会把同一不可变对象重新写回。
+# 会话级锁在连接关闭/进程崩溃时由 PostgreSQL 自动释放，不会残留死锁。
+
+PAYLOAD_LOCK_CLASSID = 91248
+
+
+def payload_lock_key(digest: str) -> int:
+    """摘要 -> 31 位非负锁号（与固定 classid 组成咨询锁二元键）。"""
+    return int(digest[:8], 16) & 0x7FFFFFFF
+
+
+async def acquire_payload_lock(
+    conn: asyncpg.Connection, digest: str
+) -> None:
+    """会话级摘要锁（阻塞直到获得）：用于跨越多个事务/事务外 PUT 的提交流程。
+
+    必须由调用方在 finally 中配对 release_payload_lock；连接归还/崩溃时锁也会
+    自动释放。
+    """
+    await conn.execute(
+        "SELECT pg_advisory_lock($1, $2)",
+        PAYLOAD_LOCK_CLASSID,
+        payload_lock_key(digest),
+    )
+
+
+async def release_payload_lock(
+    conn: asyncpg.Connection, digest: str
+) -> None:
+    await conn.execute(
+        "SELECT pg_advisory_unlock($1, $2)",
+        PAYLOAD_LOCK_CLASSID,
+        payload_lock_key(digest),
+    )
+
+
+async def acquire_payload_xact_lock(
+    conn: asyncpg.Connection, digest: str
+) -> None:
+    """事务级摘要锁：事务提交/回滚即自动释放（GC 删除事务、迁移批次使用）。"""
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        PAYLOAD_LOCK_CLASSID,
+        payload_lock_key(digest),
+    )
+
+
 async def delete_pending_submission(
     conn: asyncpg.Connection, source: str, event_id: str
 ) -> None:
@@ -421,6 +487,11 @@ async def finalize_event_submission(
 ) -> tuple[asyncpg.Record, bool]:
     """提交状态机终结（单事务，原子可见）。
 
+    调用方（submit/recover）必须**在事务外已持有该 digest 的会话级摘要锁**
+    （见 acquire_payload_lock）：摘要锁与 GC 删除事务互斥，是“对象上传”这种
+    数据库事务外动作与 GC 物理删除之间的互斥保证；本事务内的元数据行锁则保证
+    引用计数与 GC 行锁复核串行。
+
     锁对象元数据行（不存在则插入，ref_count 从 0 计起）后插入事件并建投递；
     事件唯一冲突说明并发重复提交已抢先完成：回滚本次引用计数增量，返回
     (原事件行, True)。正常插入返回 (新事件行, False)。
@@ -428,9 +499,10 @@ async def finalize_event_submission(
     新事件 payload JSONB 列置 NULL——载荷本体只在对象存储；该列仅旧数据使用。
     """
     async with conn.transaction():
-        # 与垃圾回收互斥：GC 删除在持有对象元数据行锁的事务内完成“复核→删对象
-        # →删元数据”，会阻塞这里的引用建立；反之本事务未提交时引用尚不可见，
-        # GC 复核必为零引用且本对象仍处于 pending（NOT EXISTS 守卫）而不会误删。
+        # 与垃圾回收互斥：GC 删除事务先取摘要咨询锁，再在锁内“复核→删对象→
+        # 删元数据”，而提交方在 PUT 对象之前就持有同一摘要锁直至本事务提交，
+        # 因此不存在“GC 复核零引用通过后、本终结提交前对象被物理删除”的窗口。
+        # 元数据行锁进一步序列化引用计数变更。
         await conn.execute(
             """
             INSERT INTO event_payload_objects (digest, size_bytes, ref_count)
@@ -462,6 +534,12 @@ async def finalize_event_submission(
             await delete_pending_submission(conn, source, event_id)
             return existing, True
 
+        # 引用一旦建立，该摘要无论先前是否被 --rescan-store 登记为存储孤儿
+        # （无元数据行）或被主 sweep 标记为零引用候选，都必须立刻退出候选：
+        # 对象已被引用，任何后续 GC 都不得删除。
+        await conn.execute(
+            "DELETE FROM payload_gc_candidates WHERE digest = $1", digest
+        )
         await conn.execute(
             "UPDATE event_payload_objects SET ref_count = ref_count + 1 WHERE digest = $1",
             digest,
@@ -1195,8 +1273,10 @@ async def attach_payload_object_to_event(
     """把旧事件挂到内容寻址对象（同事务 upsert 元数据并维护引用计数）。
 
     对象字节由调用方（payloadadmin）先幂等上传到对象存储；此处只做数据库侧
-    链接，因此与新提交共用同一份不可变对象、自动去重。锁对象行使引用建立与
-    GC 的“行锁复核+删除”互斥，杜绝迁移与 GC 并发时的悬空引用。
+    链接，因此与新提交共用同一份不可变对象、自动去重。调用方必须已持有该
+    digest 的事务级摘要锁（acquire_payload_xact_lock）：摘要锁使引用建立与
+    GC 的“复核+物理删除”互斥，元数据行锁则与其他引用建立者串行，杜绝迁移与
+    GC 并发时的悬空引用。
     """
     await conn.execute(
         """
@@ -1216,6 +1296,10 @@ async def attach_payload_object_to_event(
         event_id_fk,
         digest,
     )
+    # 引用已建立：若是 GC 候选（含 rescan-store 登记的无元数据孤儿），立即复活。
+    await conn.execute(
+        "DELETE FROM payload_gc_candidates WHERE digest = $1", digest
+    )
     await conn.execute(
         "UPDATE event_payload_objects SET ref_count = ref_count + 1 WHERE digest = $1",
         digest,
@@ -1234,8 +1318,8 @@ async def update_migration_progress(
     await conn.execute(
         """
         UPDATE payload_migration_state
-        SET last_event_id = GREATEST(last_event_id, $2),
-            processed = processed + $3,
+        SET last_event_id = GREATEST(last_event_id, $1),
+            processed = processed + $2,
             status = 'running',
             last_error = NULL,
             updated_at = now()
@@ -1252,7 +1336,7 @@ async def set_migration_status(
     await conn.execute(
         """
         UPDATE payload_migration_state
-        SET status = $2, last_error = $3, updated_at = now()
+        SET status = $1, last_error = $2, updated_at = now()
         WHERE id = 1
         """,
         status,
@@ -1354,22 +1438,30 @@ async def list_gc_candidates(
 async def recheck_gc_candidate(
     conn: asyncpg.Connection, digest: str
 ) -> str:
-    """删除前的最终引用复核（不持有事务，调用方需在事务内 FOR UPDATE 锁定）。
+    """删除前的最终引用复核（调用方须先持摘要咨询锁并在已开启的事务内调用）。
 
-    必须在调用方已开启的事务中、对对象元数据行加锁后使用；本函数只判定，
-    不改数据。返回：
+    调用方必须：
+    1. 先 acquire_payload_xact_lock(digest)——与提交/恢复/迁移建立引用的全程
+       互斥，这是存储孤儿（无元数据行）唯一可用的串行化手段；
+    2. 在事务内调用本函数。本函数再对元数据行 `FOR UPDATE` 并直接核对
+       events 实际引用，只判定、不改数据。返回：
     - 'delete'   ：零引用且无进行中提交（或元数据不存在的存储孤儿键）；
-    - 'reanimate'：引用已重建（并发提交/重放复用了同一内容对象）或仍有进行中
-                   提交，候选应移除/重新计时，对象保留。
+    - 'reanimate'：引用已重建（并发提交/恢复/迁移/重放复用了同一内容对象）
+                   或仍有进行中提交，候选应移除/重新计时，对象保留。
     """
     obj = await conn.fetchrow(
         "SELECT ref_count FROM event_payload_objects WHERE digest = $1 FOR UPDATE",
         digest,
     )
+    # 直接核对真实引用行（不盲信 ref_count 计数器）：无论元数据行是否存在，
+    # 只要有一个事件引用该摘要，对象就不得删除。
+    referenced = await conn.fetchval(
+        "SELECT 1 FROM events WHERE payload_digest = $1 LIMIT 1", digest
+    )
     in_flight = await conn.fetchval(
         "SELECT 1 FROM payload_upload_pending WHERE digest = $1 LIMIT 1", digest
     )
-    if in_flight is not None:
+    if in_flight is not None or referenced is not None:
         return "reanimate"
     if obj is not None and obj["ref_count"] > 0:
         return "reanimate"
@@ -1379,12 +1471,23 @@ async def recheck_gc_candidate(
 async def delete_payload_metadata_locked(
     conn: asyncpg.Connection, digest: str
 ) -> None:
-    """在已持有行锁的事务内删除候选行与（零引用的）对象元数据。"""
+    """在已持有摘要锁的事务内删除候选行与（确无引用的）对象元数据。
+
+    元数据删除带 ref_count = 0 守卫；events 实际引用由调用方的最终复核保证
+    不存在（此处再以 NOT EXISTS 兜底，杜绝任何计数器漂移导致的悬空引用）。
+    """
     await conn.execute(
         "DELETE FROM payload_gc_candidates WHERE digest = $1", digest
     )
     await conn.execute(
-        "DELETE FROM event_payload_objects WHERE digest = $1 AND ref_count = 0",
+        """
+        DELETE FROM event_payload_objects o
+        WHERE o.digest = $1
+          AND o.ref_count = 0
+          AND NOT EXISTS (
+              SELECT 1 FROM events e WHERE e.payload_digest = o.digest
+          )
+        """,
         digest,
     )
 
@@ -1443,13 +1546,55 @@ async def count_pending_submissions(conn: asyncpg.Connection) -> int:
     return await conn.fetchval("SELECT COUNT(*) FROM payload_upload_pending")
 
 
+async def count_zero_ref_payload_objects(conn: asyncpg.Connection) -> int:
+    """ref_count=0 且确无事件引用的元数据对象数（下一标记轮的候选来源）。"""
+    return await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM event_payload_objects o
+        WHERE o.ref_count = 0
+          AND NOT EXISTS (SELECT 1 FROM events e WHERE e.payload_digest = o.digest)
+        """
+    )
+
+
+async def list_gc_candidate_rows(
+    conn: asyncpg.Connection, *, grace_seconds: int, limit: int = 200
+) -> list[asyncpg.Record]:
+    """候选明细（GC 状态 API 用）：含是否已过宽限期与当前引用状态。
+
+    左连接元数据表：--rescan-store 登记的存储孤儿没有元数据行（has_metadata=f），
+    这类候选同样经历宽限与摘要锁复核后才会删除。
+    """
+    rows = await conn.fetch(
+        """
+        SELECT c.digest,
+               c.first_seen_at,
+               (o.digest IS NOT NULL) AS has_metadata,
+               COALESCE(o.ref_count, 0) AS ref_count,
+               (c.first_seen_at < now() - make_interval(secs => $1::float8))
+                   AS past_grace,
+               EXISTS (SELECT 1 FROM events e
+                       WHERE e.payload_digest = c.digest) AS referenced,
+               EXISTS (SELECT 1 FROM payload_upload_pending p
+                       WHERE p.digest = c.digest) AS submission_in_flight
+        FROM payload_gc_candidates c
+        LEFT JOIN event_payload_objects o ON o.digest = c.digest
+        ORDER BY c.first_seen_at
+        LIMIT $2
+        """,
+        float(grace_seconds),
+        limit,
+    )
+    return list(rows)
+
+
 async def start_gc_run(
     conn: asyncpg.Connection, *, rescanned_store: bool
 ) -> int:
     return await conn.fetchval(
         """
         INSERT INTO payload_gc_runs (status, rescanned_store)
-        VALUES ('running', $2)
+        VALUES ('running', $1)
         RETURNING id
         """,
         rescanned_store,

@@ -177,6 +177,36 @@ class GCRunOut(BaseModel):
     finished_at: datetime | None
 
 
+class GCCandidateOut(BaseModel):
+    """单个 GC 候选（只含摘要与状态，绝不含载荷内容）。"""
+
+    digest: str
+    first_seen_at: datetime
+    # 是否已过宽限期（过宽限且复核仍零引用才会在下一轮 GC 删除）
+    past_grace: bool
+    # 元数据行是否存在：--rescan-store 登记的存储孤儿为 false
+    has_metadata: bool
+    ref_count: int
+    # 复核守卫的实时状态：已被事件引用 / 有进行中提交 -> 下轮复核复活
+    referenced: bool
+    submission_in_flight: bool
+
+
+class GCStatusOut(BaseModel):
+    """垃圾回收状态：候选明细、宽限配置与最近运行记录（不含载荷内容）。"""
+
+    grace_seconds: int
+    total_candidates: int
+    # 已过宽限期的候选数；候选过多、明细被截断时为 null（总数仍准确）
+    candidates_past_grace: int | None
+    candidates_truncated: bool
+    # 当前 ref_count=0 且无事件引用的对象数（下一标记轮将登记为候选）
+    zero_reference_objects: int
+    pending_submissions: int
+    candidates: list[GCCandidateOut]
+    runs: list[GCRunOut]
+
+
 class PayloadStorageStatusOut(BaseModel):
     """事件载荷对象存储与迁移/回收状态（不含载荷内容）。"""
 

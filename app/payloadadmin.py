@@ -21,8 +21,14 @@
         # --rescan-store 同时登记对象存储里有、数据库元数据里没有的孤儿
         # （同样需要再过一轮宽限才会删除）。
 
-所有命令与在线提交/投递并发安全：标记不阻塞写入，删除前在对象元数据行锁内
-复核引用与进行中的提交状态机，并发提交或死信重放正在复用的对象会被复活。
+    python -m app.payloadadmin gc-status
+        # 与 GET /api/v1/payloads/gc 相同的回收状态（候选/宽限/引用守卫/运行记录）
+
+所有命令与在线提交/投递并发安全：标记不阻塞写入，删除前先取“按摘要的咨询锁”、
+再在对象元数据行锁内复核 events 实际引用与进行中提交，与同摘要的新事件提交、
+崩溃恢复、在线迁移建立引用全程互斥；对象一旦被引用都不会被删除，正在复用的
+对象会被复活。对象删除失败只重置该候选宽限，可安全重试，不影响提交状态机与
+事件/投递幂等语义。
 """
 from __future__ import annotations
 
@@ -204,6 +210,52 @@ async def _gc(grace_seconds: int, rescan_store: bool, batch_size: int) -> int:
         await close_pool()
 
 
+# -- gc-status --------------------------------------------------------------------
+
+async def _gc_status() -> int:
+    pool = await init_db()
+    try:
+        async with pool.acquire() as conn:
+            status = await payloads.gc_status(conn)
+    finally:
+        await close_pool()
+    past = status["candidates_past_grace"]
+    print(
+        f"GC 宽限期={status['grace_seconds']}s，候选总数={status['total_candidates']}"
+        + ("（已过宽限：统计被截断，见 HTTP API）" if past is None
+           else f"，已过宽限={past}")
+    )
+    print(
+        f"零引用对象={status['zero_reference_objects']}，"
+        f"进行中提交状态机={status['pending_submissions']}"
+    )
+    for c in status["candidates"]:
+        flags = []
+        flags.append("已过宽限" if c["past_grace"] else "宽限中")
+        flags.append("有元数据" if c["has_metadata"] else "存储孤儿")
+        if c["referenced"]:
+            flags.append("已被事件引用(将复活)")
+        if c["submission_in_flight"]:
+            flags.append("提交进行中(将复活)")
+        print(
+            f"  {c['digest']} first_seen={c['first_seen_at'].isoformat()} "
+            f"ref_count={c['ref_count']} [{' / '.join(flags)}]"
+        )
+    if status["candidates_truncated"]:
+        print("  （候选超过 200 条，仅显示最早的 200 条；完整状态见 HTTP API）")
+    if status["runs"]:
+        print("最近 GC 运行：")
+        for r in status["runs"]:
+            print(
+                f"  #{r['id']} [{r['status']}] candidates={r['candidates']} "
+                f"deleted={r['deleted_objects']} rescan_store={r['rescanned_store']}"
+                + (f" error={r['last_error']}" if r["last_error"] else "")
+            )
+    else:
+        print("GC 运行：无")
+    return 0
+
+
 # -- entrypoint ------------------------------------------------------------------
 
 def main() -> None:
@@ -242,6 +294,8 @@ def main() -> None:
     )
     p_gc.add_argument("--batch-size", type=int, default=100)
 
+    sub.add_parser("gc-status", help="GC 候选/宽限/引用守卫/运行状态")
+
     args = parser.parse_args()
     if args.command == "status":
         code = asyncio.run(_status(args.verbose))
@@ -253,6 +307,8 @@ def main() -> None:
         code = asyncio.run(_clear_legacy(args.batch_size))
     elif args.command == "gc":
         code = asyncio.run(_gc(args.grace_seconds, args.rescan_store, args.batch_size))
+    elif args.command == "gc-status":
+        code = asyncio.run(_gc_status())
     else:  # pragma: no cover
         parser.error("未知命令")
         code = 2

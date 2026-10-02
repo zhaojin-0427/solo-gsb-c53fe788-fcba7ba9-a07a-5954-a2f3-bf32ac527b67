@@ -11,7 +11,9 @@
   提交由**持久化状态机**协调“对象上传”与“数据库事务”，任一步失败或进程重启
   都不会产生可见半成品、悬空引用或重复投递。Worker 取载荷时**先复核摘要再
   HMAC 签名**。旧 JSONB 数据支持**可断点续跑的在线迁移与双读**，并提供带
-  **引用复核 + 宽限期**的幂等垃圾回收（GC）。详见下文
+  **按摘要咨询锁引用互斥 + 引用复核 + 宽限期**的幂等垃圾回收（GC）：对象一旦
+  被引用（无论元数据行是否存在）都不会被并发 GC 删除，删除失败可安全重试。
+  详见下文
   [“事件载荷对象存储（内容寻址/去重/迁移/回收）”](#事件载荷对象存储内容寻址去重迁移回收)。
 - **事件幂等提交**：生产者以 `(source, event_id)` 提交事件；重复提交返回原事件
   （HTTP 200，响应体 `duplicate: true`），**不新增任何投递**。
@@ -67,7 +69,7 @@ MinIO 控制台：<http://localhost:9001>（默认凭据 `minioadmin / minioadmi
 `docker compose run --rm api python -m app.keyadmin <子命令>`，详见
 [“订阅密钥信封加密与主密钥轮换”](#订阅密钥信封加密与主密钥轮换)。
 
-载荷对象管理命令（旧 JSONB 在线迁移、垃圾回收、崩溃恢复、状态查看）：
+载荷对象管理命令（旧 JSONB 在线迁移、垃圾回收与候选状态、崩溃恢复、状态查看）：
 `docker compose run --rm api python -m app.payloadadmin <子命令>`，详见
 [“事件载荷对象存储（内容寻址/去重/迁移/回收）”](#事件载荷对象存储内容寻址去重迁移回收)。
 
@@ -139,6 +141,8 @@ curl -s localhost:8001/received | python3 -m json.tool
 # 6) 查看事件载荷的内容地址（payload_digest 即规范化 JSON 的 SHA-256）
 #    与对象存储去重/迁移/GC 状态（对象本体在 MinIO 的 webhook-payloads 桶中）
 curl -s localhost:8000/api/v1/payloads/status | python3 -m json.tool
+#    垃圾回收候选/宽限/引用互斥状态（无候选时 candidates 为空数组）：
+curl -s localhost:8000/api/v1/payloads/gc | python3 -m json.tool
 # 也可在 MinIO 控制台 http://localhost:9001 浏览 webhook-payloads 桶（minioadmin/minioadmin）
 ```
 
@@ -188,6 +192,7 @@ curl -i -X POST localhost:8000/api/v1/dead-letters/<delivery_id>/replay
 | POST | `/dead-letters/{id}/replay` | 死信重放（201；非死信 409；链上有未完成投递 409） |
 | GET | `/crypto/status` | 密钥环/迁移/轮换状态（只含 key_id，不含密钥材料） |
 | GET | `/payloads/status` | 载荷对象存储/去重/在线迁移/GC 状态（只含计数，不含载荷内容） |
+| GET | `/payloads/gc` | 垃圾回收状态：候选明细（摘要/宽限/引用守卫）、零引用对象数、最近 GC 运行 |
 | GET | `/health` | 健康检查 |
 
 投递状态：`pending`（等待/退避中）、`in_flight`（已被 Worker 认领）、
@@ -351,10 +356,12 @@ hmac.compare_digest(expected, signature_v1)
 （表 `payload_upload_pending`，规范化字节直接存在行内）协调：
 
 1. **查重**：`(source, event_id)` 已存在 → 直接幂等返回，不触对象存储；
-2. **登记状态机行**（独立事务，含规范化字节）：崩溃后字节仍在、可重放；
-3. **幂等上传对象**（事务外）：内容寻址，重复/并发/重传同键都安全；
+2. **取摘要咨询锁并登记状态机行**（独立事务，含规范化字节）：摘要锁与 GC 物理
+   删除互斥，覆盖后续上传与终结全程；崩溃后字节仍在、锁随连接自动释放，可重放；
+3. **持锁幂等上传对象**（事务外）：内容寻址，重复/并发/重传同键都安全；
 4. **终结事务**（单数据库事务，锁对象元数据行）：upsert 对象元数据并维护引用
-   计数 → 插入事件（payload 置 NULL，只挂摘要）→ 建投递 → 删除状态机行。
+   计数 → 插入事件（payload 置 NULL，只挂摘要）→ 从 GC 候选移除（复活）→ 建
+   投递 → 删除状态机行。
 
 外部观察者只能看到“完全没有该事件”或“事件 + 投递 + 对象引用齐备”，不存在
 可见半成品。任一步失败或进程重启：
@@ -406,7 +413,7 @@ curl -s localhost:8000/api/v1/payloads/status | python3 -m json.tool
 - 对象存储暂时不可用时当批回滚、运行标记 `failed`，恢复后重跑续跑；
 - `clear-legacy` 只清已挂对象引用的行，因此任何时刻双读都有数据源。
 
-### 垃圾回收（幂等：引用复核 + 宽限期，防误删）
+### 垃圾回收（幂等：引用互斥 + 宽限复核，防误删）
 
 载荷对象只在**确认不再被任何事件引用**后回收。GC 分阶段、可反复安全运行：
 
@@ -417,22 +424,106 @@ docker compose run --rm api python -m app.payloadadmin gc
 # 同时扫描对象存储里“有对象、数据库无元数据”的孤儿（如崩溃残留），
 # 首轮只登记，过了宽限期后的后续 gc 才真正删除
 docker compose run --rm api python -m app.payloadadmin gc --rescan-store
+
+# 查看 GC 候选/宽限/引用守卫/运行记录（CLI，等价于 GET /api/v1/payloads/gc）
+docker compose run --rm api python -m app.payloadadmin gc-status
 ```
 
-删除一个对象前有四重保护，**并发提交或死信重放正在复用的对象不会被误删**：
+#### 物理删除与并发提交/恢复/迁移的引用互斥
+
+“对象存储里已有某 SHA-256 对象、数据库里还没有元数据行”（`--rescan-store`
+登记的孤儿）时没有行锁可用，因此除元数据行锁外，系统对**每个摘要再设一把
+PostgreSQL 咨询锁**，把对象的物理删除与一切“建立引用”的动作两两互斥：
+
+| 动作 | 持锁范围 |
+| --- | --- |
+| 事件提交 | 会话级摘要锁，覆盖“登记 pending → 事务外 PUT 对象 → 终结事务提交”全程 |
+| 崩溃恢复（recover） | 会话级摘要锁，覆盖“补传对象 → 终结事务提交” |
+| 在线迁移（migrate） | 事务级摘要锁（批内按摘要排序加锁防自死锁），覆盖“PUT 对象 → 挂引用提交” |
+| GC 删除 | 事务级摘要锁，覆盖“最终复核 → 物理删除对象 → 删元数据提交” |
+
+由此得到保证：
+
+- **对象一旦被引用就不会被删除**——无论元数据行当时是否存在。引用建立事务
+  在锁内还会把该摘要从候选表移除（候选复活）；GC 最终复核除 `ref_count` 外
+  再直接核对 `events` 实际引用行与进行中的 `payload_upload_pending`；
+- **GC 抢先物理删除也不产生悬空引用**：后拿到锁的提交/恢复执行幂等 PUT，
+  会把同一不可变对象按同一 SHA-256 键原样写回，再建立引用；
+- **删除失败可安全重试**：对象 DELETE 幂等（404 视为成功），失败仅把该候选
+  `first_seen_at` 重置（宽限重新计时），不触碰事件幂等、重复去重与提交状态机；
+- 会话级锁在连接关闭/进程崩溃时由 PostgreSQL 自动释放，不残留死锁。
+
+删除一个对象前共有四重保护，**并发提交、恢复、迁移或死信重放正在复用的对象
+不会被误删**：
 
 1. 标记阶段只收集 `ref_count = 0` 的对象；
 2. `NOT EXISTS payload_upload_pending`：进行中的提交（引用尚未在终结事务建立）
-   不进入候选；
+   不进入候选；存储孤儿扫描同样跳过已有 pending 行的摘要；
 3. **宽限期**（`PAYLOAD_GC_GRACE_SECONDS`，默认 3600 秒）：候选首次见后必须
    持续零引用超过宽限期；引用在期间重建的对象被“复活”保留；
-4. 删除时在**单个数据库事务**内“锁对象元数据行（`FOR UPDATE`）→ 复核引用计数
-   与进行中提交 → 删对象 → 删元数据”，行锁贯穿物理删除全程——并发提交的终结
-   事务在该锁上阻塞，因而不存在“复核零引用后、删除前被并发建引用”的窗口；
-   对象删除失败则宽限重置、整轮回滚该候选，下次重试。
+4. 删除时在**单个数据库事务**内“取摘要咨询锁 → 锁对象元数据行（`FOR UPDATE`）
+   → 复核 events 实际引用/引用计数/进行中提交 → 删对象 → 删元数据”，摘要锁与
+   元数据行锁贯穿物理删除全程——并发提交/恢复/迁移在摘要锁上阻塞，因而不存在
+   “复核零引用后、删除前被并发建引用”的窗口；对象删除失败则宽限重置、该候选
+   本轮回滚，下次重试。
 
 宽限期默认 1 小时：因此典型节奏是**定时跑 `gc`**（第一轮标记、后续轮删除到期
 候选）。`gc` 幂等，重复运行只会推进真正到期且仍零引用的对象。
+
+#### 通过 HTTP API 查询回收状态
+
+`GET /api/v1/payloads/gc` 返回候选明细（摘要、首次见时间、是否过宽限、元数据
+是否存在、当前引用计数/是否已被事件引用/是否有进行中提交）与最近 GC 运行记录；
+只含摘要与计数，绝不含载荷内容。
+
+请求：
+
+```bash
+curl -s localhost:8000/api/v1/payloads/gc | python3 -m json.tool
+```
+
+响应（示例：一个已过宽限、尚未被引用的零引用候选，最近一次 gc 无删除）：
+
+```json
+{
+  "grace_seconds": 3600,
+  "total_candidates": 1,
+  "candidates_past_grace": 1,
+  "candidates_truncated": false,
+  "zero_reference_objects": 1,
+  "pending_submissions": 0,
+  "candidates": [
+    {
+      "digest": "4337dfcec6e04f28ee9746aad8fe0cf8b24048f23544b4c7782b3a8596b497c4",
+      "first_seen_at": "2026-10-02T08:33:21.402128Z",
+      "past_grace": true,
+      "has_metadata": true,
+      "ref_count": 0,
+      "referenced": false,
+      "submission_in_flight": false
+    }
+  ],
+  "runs": [
+    {
+      "id": 3,
+      "status": "completed",
+      "candidates": 1,
+      "deleted_objects": 0,
+      "rescanned_store": true,
+      "last_error": null,
+      "started_at": "2026-10-02T09:00:02.118000Z",
+      "finished_at": "2026-10-02T09:00:02.504000Z"
+    }
+  ]
+}
+```
+
+- `has_metadata=false` 的候选即 `--rescan-store` 登记的“存储里有、数据库无
+  元数据”的对象；`past_grace=true` 表示下一轮 GC 复核通过即会物理删除；
+- 一旦同摘要被新事件提交/恢复/迁移引用，该候选立即从 `candidates` 消失
+  （终结事务在摘要锁内复活），随后再跑 `gc` 也不会删除对象；
+- `candidates_truncated=true` 时候选超过 200 条、只返回最早 200 条，
+  `candidates_past_grace` 置 `null`（`total_candidates` 仍准确）。
 
 ### 载荷对象存储配置
 
@@ -756,7 +847,10 @@ WEBHOOK_ALLOWED_HOSTS=receiver,127.0.0.1,localhost docker compose up --build
 - `payload_migration_state`：旧 JSONB 在线迁移的单行进度（状态、事件 id 游标、
   已处理数、错误），支持断点续跑与失败恢复。
 - `payload_gc_candidates` / `payload_gc_runs`：GC 的零引用候选（带首次见
-  时间戳，实现宽限期）与回收运行审计记录。
+  时间戳，实现宽限期；既含零引用元数据对象，也含 `--rescan-store` 登记的
+  “有对象、无元数据”存储孤儿）与回收运行审计记录。引用建立与物理删除的
+  互斥除元数据行锁外，另由固定 classid 的**按摘要 PostgreSQL 咨询锁**
+  （提交/恢复用会话级、迁移与 GC 用事务级）保证，锁不建表、崩溃自动释放。
 - `subscriptions`：订阅身份（source、启用状态、`current_revision`）。
   `target_url` 列随当前版本冗余同步；`secret` 冗余列不再保存明文（统一置空），
   权威配置在版本表。
@@ -804,9 +898,10 @@ python -m app.keyadmin status
 python -m app.payloadadmin status
 python -m app.payloadadmin migrate
 python -m app.payloadadmin gc --rescan-store
+python -m app.payloadadmin gc-status   # GC 候选/宽限/引用互斥状态（同 GET /payloads/gc）
 ```
 
-仓库还包含四个本地验证脚本（非 Docker 依赖，会自动拉起便携 PostgreSQL；
+仓库还包含五个本地验证脚本（非 Docker 依赖，会自动拉起便携 PostgreSQL；
 载荷对象用本地文件后端 `PAYLOAD_STORE_MODE=local`，无需 MinIO）：
 
 - `test_e2e.py`：完整四进程拓扑，覆盖幂等、顺序、退避死信、重放、租约接管、
@@ -823,4 +918,9 @@ python -m app.payloadadmin gc --rescan-store
   规范化键序归一、提交状态机崩溃恢复（补传对象、无悬空引用、不重复投递）、
   旧 JSONB 在线迁移与双读切换/clear-legacy、Worker 摘要校验
   （篡改对象 -> `payload_integrity`，恢复后重试成功）、GC 宽限/行锁复核/
-  复活保护与 `--rescan-store` 孤儿回收。
+  复活保护与 `--rescan-store` 孤儿回收；
+- `test_gc_race.py`：GC 物理删除与同摘要并发提交/恢复/迁移的**引用互斥**专项
+  ——以 `pg_locks` 实证提交持锁时 GC 删除事务在摘要咨询锁上等待并复活候选、
+  GC 先删孤儿后到提交幂等重建对象不留悬空引用、删除失败安全重试不破坏幂等、
+  24 提交 × 12 GC 随机交错后所有引用对象必存在且计数无漂移，并验证
+  `GET /api/v1/payloads/gc` 状态查询。

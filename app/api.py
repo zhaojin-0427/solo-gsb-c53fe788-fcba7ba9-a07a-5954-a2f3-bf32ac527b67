@@ -25,6 +25,8 @@ from app.schemas import (
     EventCreate,
     EventOut,
     GCRunOut,
+    GCStatusOut,
+    GCCandidateOut,
     PayloadStorageStatusOut,
     ReplayOut,
     ReplayRequest,
@@ -610,4 +612,27 @@ async def payload_storage_status() -> PayloadStorageStatusOut:
             else None,
         },
         gc_runs=[GCRunOut(**dict(r)) for r in gc_runs],
+    )
+
+
+@router.get("/payloads/gc", response_model=GCStatusOut, tags=["payloads"])
+async def payload_gc_status() -> GCStatusOut:
+    """垃圾回收状态：GC 候选明细（摘要/首次见时间/是否过宽限/引用守卫状态）、
+    零引用对象数、进行中的提交状态机行数与最近 GC 运行记录。
+
+    只返回摘要与计数，绝不含载荷内容。可用于在删除前后确认回收进度，或核对
+    “对象一旦被引用就不会被删除”的引用互斥是否把候选复活。
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        status = await payloads.gc_status(conn)
+    return GCStatusOut(
+        grace_seconds=status["grace_seconds"],
+        total_candidates=status["total_candidates"],
+        candidates_past_grace=status["candidates_past_grace"],
+        candidates_truncated=status["candidates_truncated"],
+        zero_reference_objects=status["zero_reference_objects"],
+        pending_submissions=status["pending_submissions"],
+        candidates=[GCCandidateOut(**c) for c in status["candidates"]],
+        runs=[GCRunOut(**r) for r in status["runs"]],
     )

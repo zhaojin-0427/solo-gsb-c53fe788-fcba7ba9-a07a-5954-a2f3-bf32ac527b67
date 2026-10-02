@@ -254,8 +254,8 @@ def main() -> int:
             dig = hashlib.sha256(data).hexdigest()
             await conn.execute(
                 """INSERT INTO payload_upload_pending
-                   (digest, source, event_id, payload_bytes, owner_id, updated_at)
-                   VALUES ($1,'ord','e-crash',$2,'dead', now() - interval '1 hour')""",
+                   (digest, source, event_id, payload_bytes, owner_id, status, updated_at)
+                   VALUES ($1,'ord','e-crash',$2,'dead','submitting', now() - interval '1 hour')""",
                 dig, data)
             await conn.close()
             return dig
@@ -364,7 +364,7 @@ def main() -> int:
         dig_t = canon_digest(payload_t)
         api.post("/api/v1/events", json={
             "source": "tamper", "event_id": "t-1", "payload": payload_t})
-        dt = wait_for(lambda: delivery_of_t(api, "t-1"), "t-1 投递")
+        dt = wait_for(lambda: delivery_of_t(api, "t-1"), "t-1 投递")["id"]
         wait_for(lambda: api.get(f"/api/v1/deliveries/{dt}").json()
                  ["attempts_made"] >= 1, "t-1 已首次尝试")
         # 篡改对象内容（键保持不变）
